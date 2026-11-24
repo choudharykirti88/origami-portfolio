@@ -6,62 +6,155 @@
   const ctx = canvas.getContext('2d');
   let width = 0, height = 0, dpr = 1, last = 0, frame = 0;
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const touches = [];
-  const petals = Array.from({length: reduceMotion ? 16 : 75}, (_, i) => ({
-    x: Math.random(), y: Math.random(), size: 2.5 + Math.random() * 7,
-    speed: .12 + Math.random() * .45, drift: Math.random() * 6.28,
-    color: ['#f7d1bc','#ffffff','#edc9d3','#d6e9c8'][i % 4], spin: Math.random() * 7
+  // Water layer: procedurally animated refraction, caustics, glints,
+  // click/pointer ripples and wakes following each floating origami boat.
+  const ripples = [];
+  const reduceDensity = window.matchMedia('(max-width: 650px)').matches;
+  const petals = Array.from({length: reduceMotion ? 10 : reduceDensity ? 28 : 55}, (_, i) => ({
+    x: Math.random(), y: Math.random(), size: 2.2 + Math.random() * 5.5,
+    speed: .07 + Math.random() * .19, phase: Math.random() * 6.28,
+    color: ['#fff8eb','#f6d8ca','#ffffff','#e9edcb'][i % 4]
   }));
-  const bubbles = Array.from({length: 28}, () => ({x: Math.random(),y:Math.random(),r:2+Math.random()*6,t:Math.random()*10}));
-  let pointer = {x:-999,y:-999};
-  let hoveredBoat = false;
+  const boatElements = [...document.querySelectorAll('.boat')];
+  const boatHistory = new Map();
+  const sparkles = Array.from({length: reduceDensity ? 24 : 60}, () => ({
+    x:Math.random(),y:Math.random(),phase:Math.random()*Math.PI*2,size:1+Math.random()*2.2
+  }));
   let twilight = false;
   let soundOn = false, audioContext, oscillators = [];
   const clamp = (x, min, max) => Math.max(min, Math.min(max, x));
+  let pointer = {x:-999,y:-999};
 
   function resize() {
     const rect = canvas.getBoundingClientRect();
     width = rect.width; height = rect.height;
     dpr = Math.min(window.devicePixelRatio || 1, 2);
-    canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    boatHistory.clear();
   }
-  function ripple(x, y, strength = 1) {
-    touches.push({x,y,r:0,life:1,s:strength});
-    if (touches.length > 36) touches.shift();
+  function ripple(x, y, strength = 1, wake = false) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    ripples.push({x,y,r:wake?8:2,life:1,strength,wake});
+    if (ripples.length > 65) ripples.splice(0, ripples.length - 65);
+  }
+  function drawWaterBase(t) {
+    const fill = ctx.createLinearGradient(0,0,width,height);
+    if (twilight) {
+      fill.addColorStop(0,'#b5b3ce');fill.addColorStop(.5,'#739eb0');fill.addColorStop(1,'#326e87');
+    } else {
+      fill.addColorStop(0,'#e7f1dd');fill.addColorStop(.43,'#b4dfcf');fill.addColorStop(1,'#70bcba');
+    }
+    ctx.fillStyle=fill;ctx.fillRect(0,0,width,height);
+    const light = ctx.createRadialGradient(width*.34,height*.15,10,width*.46,height*.37,Math.max(width,height)*.82);
+    light.addColorStop(0,twilight?'rgba(255,220,189,.20)':'rgba(255,255,236,.42)');
+    light.addColorStop(1,'rgba(255,255,255,0)');
+    ctx.fillStyle=light;ctx.fillRect(0,0,width,height);
+
+    // Layered, slowly shifting sine wave bands. Vertical shape is deliberately shallow.
+    const step = reduceDensity ? 14 : 10;
+    for(let band=0;band<23;band++) {
+      const y0=(band+.5)*height/23;
+      ctx.beginPath();
+      for(let x=-step;x<=width+step;x+=step){
+        const y=y0 + Math.sin(x*.011+t*.85+band*.73)*8
+                   + Math.sin(x*.025-t*.58+band*1.7)*3;
+        if(x===-step)ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.strokeStyle=twilight?'rgba(230,242,249,.11)':'rgba(255,255,240,.19)';
+      ctx.lineWidth=band%4===0?2.3:1.05;
+      ctx.stroke();
+    }
+    // Animated caustic threads: underwater light patterns that continuously deform.
+    const spacing=reduceDensity?76:56;
+    for(let row=-1;row<Math.ceil(height/spacing)+1;row++){
+      for(let col=-1;col<Math.ceil(width/spacing)+1;col++){
+        const cx=col*spacing + Math.sin(t*.43+row*.8+col*.5)*15;
+        const cy=row*spacing + Math.cos(t*.52+col*.9+row*.3)*12;
+        const radius=spacing*(.38+Math.sin(t*.6+row+col)*.09);
+        ctx.beginPath();
+        ctx.moveTo(cx-radius,cy);
+        ctx.bezierCurveTo(cx-radius*.45,cy-radius*.35,cx+radius*.30,cy-radius*.45,cx+radius,cy);
+        ctx.bezierCurveTo(cx+radius*.39,cy+radius*.29,cx-radius*.35,cy+radius*.41,cx-radius,cy);
+        ctx.strokeStyle=twilight?'rgba(221,239,245,.085)':'rgba(255,255,239,.16)';
+        ctx.lineWidth=1.5;ctx.stroke();
+      }
+    }
   }
   function draw(now = 0) {
-    const dt = Math.min((now-last)/1000 || .016,.05); last = now;
+    const dt = Math.min(Math.max((now-last)/1000 || .016,0),.05);last=now;
     frame += dt;
+    const t=frame;
     ctx.clearRect(0,0,width,height);
-    // Soft moving elliptical currents produce a watery scene without bitmap assets.
-    for(let i=0;i<13;i++) {
-      const x = ((i*187 + frame*(i%2 ? 2.8:-2.5)) % (width+500)+width+500)%(width+500)-250;
-      const y = (height*.15 + i*97) % Math.max(height,1);
-      ctx.beginPath(); ctx.ellipse(x,y,110+i%3*38,19+i%4*4,-.12,0,Math.PI*2);
-      ctx.strokeStyle = twilight ? 'rgba(244,229,218,.09)' : 'rgba(255,255,255,.20)';
-      ctx.lineWidth=1.5; ctx.stroke();
+    if (!window.__pondWebGLActive) drawWaterBase(t);
+
+    for(const glint of sparkles){
+      const x=glint.x*width+Math.sin(t*.6+glint.phase)*14;
+      const y=glint.y*height+Math.cos(t*.52+glint.phase)*10;
+      const alpha=Math.pow(Math.max(0,Math.sin(t*1.45+glint.phase)),4)*.52;
+      ctx.strokeStyle=`rgba(255,255,245,${alpha})`;
+      ctx.lineWidth=1;ctx.beginPath();
+      ctx.moveTo(x-glint.size*2,y);ctx.lineTo(x+glint.size*2,y);
+      ctx.moveTo(x,y-glint.size);ctx.lineTo(x,y+glint.size);ctx.stroke();
     }
-    // Animated glints and drifting paper petals.
-    for(const p of petals) {
-      const x=(p.x*width + Math.sin(frame*.33+p.drift)*38 + frame*p.speed*8)%(width+25);
-      const y=(p.y*height + Math.cos(frame*.45+p.drift)*15 + frame*p.speed*6)%(height+25);
-      ctx.save();ctx.translate(x,y);ctx.rotate(Math.sin(frame*.7+p.spin)*.5);
-      ctx.fillStyle=p.color;ctx.globalAlpha=.55;ctx.beginPath();ctx.ellipse(0,0,p.size*.57,p.size,Math.PI/4,0,Math.PI*2);ctx.fill();ctx.restore();
+    for(const p of petals){
+      const x=((p.x*width + t*p.speed*23 + Math.sin(t*.48+p.phase)*22)%(width+30));
+      const y=((p.y*height + t*p.speed*11 + Math.cos(t*.55+p.phase)*12)%(height+30));
+      ctx.save();ctx.translate(x,y);ctx.rotate(Math.sin(t*.64+p.phase)*.7);
+      ctx.fillStyle=p.color;ctx.globalAlpha=.54;ctx.beginPath();
+      ctx.ellipse(0,0,p.size*.52,p.size,.5,0,Math.PI*2);ctx.fill();ctx.restore();
     }
-    for(const b of bubbles){let x=b.x*width+Math.sin(frame+b.t)*8,y=b.y*height+Math.sin(frame*.5+b.t)*13;ctx.beginPath();ctx.arc(x,y,b.r,0,Math.PI*2);ctx.strokeStyle=twilight?'rgba(255,220,204,.15)':'rgba(255,255,255,.28)';ctx.lineWidth=1;ctx.stroke()}
-    for(let i=touches.length-1;i>=0;i--){const r=touches[i];r.r+=dt*(110+50*r.s);r.life-=dt*.65; if(r.life<=0){touches.splice(i,1);continue;} for(let j=0;j<3;j++){ctx.beginPath();ctx.ellipse(r.x,r.y,r.r-j*17,r.r*.33-j*5,0,0,Math.PI*2);ctx.lineWidth=1.3;ctx.strokeStyle=`rgba(255,255,245,${r.life*(.43-j*.12)})`;ctx.stroke()}}
+    // Very small periodic wakes under moving boats, even without cursor input.
+    if(!reduceMotion && Math.floor(t*2.7)!==Math.floor((t-dt)*2.7)){
+      const rect=canvas.getBoundingClientRect();
+      for(const boat of boatElements){
+        const b=boat.getBoundingClientRect();
+        if(b.width && b.height && b.bottom>rect.top && b.top<rect.bottom){
+          const x=b.left+b.width*.5-rect.left;
+          const y=b.top+b.height*.45-rect.top;
+          const lastPos=boatHistory.get(boat);
+          if(!lastPos || Math.hypot(x-lastPos.x,y-lastPos.y)>1.5){
+            ripple(x,y,.42,true);
+          }
+          boatHistory.set(boat,{x,y});
+        }
+      }
+    }
+    for(let i=ripples.length-1;i>=0;i--){
+      const r=ripples[i];r.r+=dt*(r.wake?38:108+32*r.strength);
+      r.life-=dt*(r.wake?.9:.72);
+      if(r.life<=0){ripples.splice(i,1);continue;}
+      for(let ring=0;ring<(r.wake?2:4);ring++){
+        const rad=r.r-ring*(r.wake?8:13);if(rad<=1)continue;
+        ctx.beginPath();ctx.ellipse(r.x,r.y,rad,rad*.42,0,0,Math.PI*2);
+        const alpha=r.life*(r.wake?.19:.38)*(1-ring*.21);
+        ctx.strokeStyle=`rgba(255,255,249,${alpha})`;
+        ctx.lineWidth=ring===0?2.4:1.25;ctx.stroke();
+        if(ring===0){
+          ctx.beginPath();ctx.ellipse(r.x,r.y+2,rad+3,(rad+3)*.42,0,0,Math.PI*2);
+          ctx.strokeStyle=`rgba(29,111,111,${alpha*.23})`;ctx.lineWidth=1;ctx.stroke();
+        }
+      }
+    }
     if(!reduceMotion)requestAnimationFrame(draw);
   }
-  window.addEventListener('resize', resize, {passive:true});resize();
+  window.addEventListener('resize',resize,{passive:true});resize();
   if(reduceMotion)draw(0);else requestAnimationFrame(draw);
   let lastRippleAt=0;
-  canvas.closest('.app').addEventListener('pointermove', e => {
-    if(e.pointerType==='touch')return;
-    const rect=canvas.getBoundingClientRect();pointer={x:e.clientX-rect.left,y:e.clientY-rect.top};
-    const now=performance.now();if(now-lastRippleAt>65){ripple(pointer.x,pointer.y,.43);lastRippleAt=now;}
-  });
-  canvas.closest('.app').addEventListener('pointerdown',e=>{const rect=canvas.getBoundingClientRect();ripple(e.clientX-rect.left,e.clientY-rect.top,1.5)});
+  const app=canvas.closest('.app');
+  app.addEventListener('pointermove',e=>{
+    if(e.pointerType==='touch'||reduceMotion)return;
+    const rect=canvas.getBoundingClientRect();
+    pointer={x:e.clientX-rect.left,y:e.clientY-rect.top};
+    const now=performance.now();
+    if(now-lastRippleAt>88){ripple(pointer.x,pointer.y,.56);lastRippleAt=now;}
+  },{passive:true});
+  app.addEventListener('pointerdown',e=>{
+    const rect=canvas.getBoundingClientRect();
+    ripple(e.clientX-rect.left,e.clientY-rect.top,1.5);
+    if(reduceMotion)draw(0);
+  },{passive:true});
 
   const views=['time','places','projects','shop','ask','socials'];
   const titles={time:'time tracker',places:"where i've been",projects:'my projects',shop:'tiny shop',ask:'ask me anything',socials:'socials'};
